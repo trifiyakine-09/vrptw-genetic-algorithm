@@ -1,3 +1,17 @@
+"""
+Solveur VRPTW (Vehicle Routing Problem with Time Windows) par algorithme
+génétique, appliqué aux instances de Solomon.
+
+Ce module contient le cœur de l'algorithme (lecture des instances,
+faisabilité, coût, représentation chromosomique, initialisation, sélection,
+croisement, mutation, boucle évolutive) ainsi qu'un CLI qui compare les
+12 combinaisons d'opérateurs.
+
+Utilisation en ligne de commande (depuis la racine du projet) :
+    python src/core.py [--seed 42]
+"""
+
+import argparse
 import math
 import random
 import copy
@@ -5,12 +19,24 @@ import sys
 import time
 import os
 
+# Une route est une liste d'indices de clients encadrée par le dépôt (0),
+# une solution est une liste de routes.
+Route    = list[int]
+Solution = list[Route]
+
+# Chemins relatifs à la racine du projet (dossier parent de src/)
+ROOT_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+INSTANCES_DIR = os.path.join(ROOT_DIR, "instances")
+RESULTS_DIR   = os.path.join(ROOT_DIR, "results")
+
 
 # =============================================================================
 # STRUCTURES DE BASE
 # =============================================================================
 
 class Customer:
+    """Client (ou dépôt pour l'indice 0) d'une instance de Solomon."""
+
     def __init__(self, id, x, y, demand, ready, due, service):
         self.id      = id
         self.x       = x
@@ -19,9 +45,15 @@ class Customer:
         self.ready   = ready
         self.due     = due
         self.service = service
+        self.dist    = []   # ligne de la matrice de distances (cf. build_distance_matrix)
 
 
-def read_vrptw_file(filename):
+def read_vrptw_file(filename: str) -> tuple[list[Customer], int, int]:
+    """
+    Lire une instance de Solomon depuis un fichier .txt.
+    Retourne (clients, nombre de véhicules, capacité) ; le dépôt est
+    l'élément d'indice 0 de la liste des clients.
+    """
     customers = []
 
     with open(filename, 'r') as f:
@@ -52,20 +84,24 @@ def read_vrptw_file(filename):
                     service = int(parts[6]),
                 ))
 
+    build_distance_matrix(customers)
     return customers, nb_vehicles, capacity
 
-def read_vrptw_content(content):
-    """Lire le fichier depuis une chaîne (pour Streamlit file_uploader)."""
+def read_vrptw_content(content: str) -> tuple[list[Customer], int, int]:
+    """
+    Lire le fichier depuis une chaîne (pour Streamlit file_uploader).
+    Même format de retour que read_vrptw_file.
+    """
     customers = []
     lines = content.splitlines()
- 
+
     for i, line in enumerate(lines):
         if "NUMBER" in line and "CAPACITY" in line:
             parts       = lines[i + 1].split()
             nb_vehicles = int(parts[0])
             capacity    = int(parts[1])
             break
- 
+
     start = False
     for line in lines:
         if "CUST NO." in line:
@@ -83,24 +119,49 @@ def read_vrptw_content(content):
                     due     = int(parts[5]),
                     service = int(parts[6]),
                 ))
- 
+
+    build_distance_matrix(customers)
     return customers, nb_vehicles, capacity
 
 
-def distance(c1, c2):
+def distance(c1: Customer, c2: Customer) -> float:
+    """Distance euclidienne entre deux clients."""
     return math.sqrt((c1.x - c2.x) ** 2 + (c1.y - c2.y) ** 2)
+
+
+def build_distance_matrix(customers: list[Customer]) -> list[list[float]]:
+    """
+    Précalculer la matrice n×n des distances, une seule fois après lecture
+    de l'instance. La ligne i est rattachée au client i (customers[i].dist),
+    ainsi customers[i].dist[j] == distance(customers[i], customers[j]).
+
+    La matrice voyage avec la liste des clients : pas de variable globale,
+    donc plusieurs sessions Streamlit sur des instances différentes ne se
+    marchent pas dessus. Les valeurs sont calculées par distance() : elles
+    sont identiques au bit près aux appels directs.
+    """
+    matrix = [[distance(c1, c2) for c2 in customers] for c1 in customers]
+    for c, row in zip(customers, matrix):
+        c.dist = row
+    return matrix
 
 
 # =============================================================================
 # FAISABILITÉ
 # =============================================================================
 
-def check_time(route, customers):
+def check_time(route: Route, customers: list[Customer]) -> bool:
+    """
+    Vérifier les fenêtres de temps d'une route.
+    Le temps de trajet vaut la distance ; on attend si on arrive avant
+    l'ouverture (ready) et la route est invalide si on arrive après la
+    fermeture (due).
+    """
     time = 0
     for i in range(len(route) - 1):
         c1 = customers[route[i]]
         c2 = customers[route[i + 1]]
-        time += distance(c1, c2)
+        time += c1.dist[route[i + 1]]
         if time < c2.ready:
             time = c2.ready
         if time > c2.due:
@@ -109,12 +170,17 @@ def check_time(route, customers):
     return True
 
 
-def check_capacity(route, customers, capacity):
+def check_capacity(route: Route, customers: list[Customer], capacity: int) -> bool:
+    """Vérifier que la demande totale de la route ne dépasse pas la capacité."""
     load = sum(customers[i].demand for i in route if i != 0)
     return load <= capacity
 
 
-def is_feasible(solution, customers, capacity):
+def is_feasible(solution: Solution, customers: list[Customer], capacity: int) -> bool:
+    """
+    Vérifier qu'une solution est réalisable : capacité et fenêtres de temps
+    respectées sur chaque route, et chaque client visité exactement une fois.
+    """
     visited = []
     for route in solution:
         clients = [i for i in route if i != 0]
@@ -133,15 +199,21 @@ def is_feasible(solution, customers, capacity):
 # COÛT
 # =============================================================================
 
-def total_distance(solution, customers):
+def total_distance(solution: Solution, customers: list[Customer]) -> float:
+    """Somme des distances parcourues sur toutes les routes de la solution."""
     dist = 0
     for route in solution:
         for i in range(len(route) - 1):
-            dist += distance(customers[route[i]], customers[route[i + 1]])
+            dist += customers[route[i]].dist[route[i + 1]]
     return dist
 
 
-def cost(solution, customers, alpha=50, beta=1):
+def cost(solution: Solution, customers: list[Customer],
+         alpha: float = 50, beta: float = 1) -> float:
+    """
+    Fonction objectif à minimiser :
+    alpha × nombre de véhicules + beta × distance totale.
+    """
     return alpha * len(solution) + beta * total_distance(solution, customers)
 
 
@@ -152,7 +224,7 @@ def cost(solution, customers, alpha=50, beta=1):
 # On la décode en routes selon capacité + fenêtres de temps
 # =============================================================================
 
-def solution_to_chromosome(solution):
+def solution_to_chromosome(solution: Solution) -> list[int]:
     """Convertit une solution (liste de routes) en chromosome (liste plate)."""
     chrom = []
     for route in solution:
@@ -162,8 +234,14 @@ def solution_to_chromosome(solution):
     return chrom
 
 
-def chromosome_to_solution(chrom, customers, capacity):
-    """Décode un chromosome en routes valides."""
+def chromosome_to_solution(chrom: list[int], customers: list[Customer],
+                           capacity: int) -> Solution:
+    """
+    Décode un chromosome en routes valides.
+    Les clients sont ajoutés dans l'ordre à la route courante tant que la
+    capacité et les fenêtres de temps le permettent ; sinon une nouvelle
+    route est ouverte.
+    """
     depot    = 0
     solution = []
     route    = [depot]
@@ -191,7 +269,13 @@ def chromosome_to_solution(chrom, customers, capacity):
 # INITIALISATION DE LA POPULATION
 # =============================================================================
 
-def init_urgency(customers, capacity, k=5):
+def init_urgency(customers: list[Customer], capacity: int, k: int = 5) -> Solution:
+    """
+    Construction gloutonne par urgence : à chaque étape, choisir au hasard
+    parmi les k clients faisables dont la fin de fenêtre (due) est la plus
+    proche. Une nouvelle route est ouverte quand plus aucun client n'est
+    insérable.
+    """
     depot     = 0
     unvisited = set(range(1, len(customers)))
     solution  = []
@@ -216,7 +300,11 @@ def init_urgency(customers, capacity, k=5):
     return solution
 
 
-def init_nearest(customers, capacity, k=5):
+def init_nearest(customers: list[Customer], capacity: int, k: int = 5) -> Solution:
+    """
+    Construction gloutonne par plus proche voisin : choisir au hasard parmi
+    les k clients faisables les plus proches du dernier client de la route.
+    """
     depot     = 0
     unvisited = set(range(1, len(customers)))
     solution  = []
@@ -236,7 +324,7 @@ def init_nearest(customers, capacity, k=5):
                 break
 
             # 🔥 tri par distance
-            feasible.sort(key=lambda i: distance(customers[last], customers[i]))
+            feasible.sort(key=lambda i: customers[last].dist[i])
 
             # 🔥 choix aléatoire parmi les k plus proches
             chosen = random.choice(feasible[:min(k, len(feasible))])
@@ -251,7 +339,11 @@ def init_nearest(customers, capacity, k=5):
     return solution
 
 
-def init_farthest(customers, capacity, k=5):
+def init_farthest(customers: list[Customer], capacity: int, k: int = 5) -> Solution:
+    """
+    Construction gloutonne par éloignement : choisir au hasard parmi les k
+    clients faisables les plus éloignés du dépôt.
+    """
     depot     = 0
     unvisited = set(range(1, len(customers)))
     solution  = []
@@ -269,7 +361,7 @@ def init_farthest(customers, capacity, k=5):
                 break
 
             # 🔥 tri décroissant
-            feasible.sort(key=lambda i: -distance(customers[depot], customers[i]))
+            feasible.sort(key=lambda i: -customers[depot].dist[i])
 
             # 🔥 choix aléatoire parmi les k plus éloignés
             chosen = random.choice(feasible[:min(k, len(feasible))])
@@ -284,7 +376,8 @@ def init_farthest(customers, capacity, k=5):
     return solution
 
 
-def init_random(customers, capacity):
+def init_random(customers: list[Customer], capacity: int) -> Solution:
+    """Construction aléatoire : choisir un client faisable au hasard."""
     depot     = 0
     unvisited = set(range(1, len(customers)))
     solution  = []
@@ -308,10 +401,13 @@ def init_random(customers, capacity):
     return solution
 
 
-def generate_population(customers, capacity, population_size):
+def generate_population(customers: list[Customer], capacity: int,
+                        population_size: int) -> list[Solution]:
     """
     Mélange des 4 méthodes :
       30% Urgence | 25% Nearest | 25% Farthest | 20% Aléatoire
+    Seules les solutions faisables sont conservées, puis la population est
+    mélangée.
     """
     n_urgency  = int(population_size * 0.30)
     n_nearest  = int(population_size * 0.25)
@@ -348,7 +444,8 @@ def generate_population(customers, capacity, population_size):
 # SÉLECTION
 # =============================================================================
 
-def tournament_selection(population, customers, k=2):
+def tournament_selection(population: list[Solution], customers: list[Customer],
+                         k: int = 2) -> Solution:
     """
     Tournoi : choisir k individus au hasard, retourner le meilleur.
     """
@@ -357,7 +454,7 @@ def tournament_selection(population, customers, k=2):
     return copy.deepcopy(best)
 
 
-def roulette_selection(population, customers):
+def roulette_selection(population: list[Solution], customers: list[Customer]) -> Solution:
     """
     Roulette : probabilité proportionnelle à la fitness inversée
     (les meilleures solutions ont plus de chances d'être choisies).
@@ -379,7 +476,8 @@ def roulette_selection(population, customers):
 # CROISEMENT (CROSSOVER)
 # =============================================================================
 
-def ox_crossover(parent1, parent2, customers, capacity):
+def ox_crossover(parent1: Solution, parent2: Solution,
+                 customers: list[Customer], capacity: int) -> Solution:
     """
     Order Crossover (OX) :
     1. Prendre un segment du parent1
@@ -411,7 +509,8 @@ def ox_crossover(parent1, parent2, customers, capacity):
     return copy.deepcopy(random.choice([parent1, parent2]))  # fallback : retourner le parent
 
 
-def pmx_crossover(parent1, parent2, customers, capacity):
+def pmx_crossover(parent1: Solution, parent2: Solution,
+                  customers: list[Customer], capacity: int) -> Solution:
     """
     Partially Mapped Crossover (PMX) :
     1. Copier un segment du parent1
@@ -465,7 +564,7 @@ def pmx_crossover(parent1, parent2, customers, capacity):
 # MUTATION
 # =============================================================================
 
-def swap_mutation(solution, customers, capacity):
+def swap_mutation(solution: Solution, customers: list[Customer], capacity: int) -> Solution:
     """
     Swap : échanger deux clients aléatoires dans le chromosome.
     """
@@ -481,7 +580,7 @@ def swap_mutation(solution, customers, capacity):
     return solution
 
 
-def insertion_mutation(solution, customers, capacity):
+def insertion_mutation(solution: Solution, customers: list[Customer], capacity: int) -> Solution:
     """
     Insertion : retirer un client et le réinsérer à la meilleure position.
     Recommandé pour le VRPTW.
@@ -511,7 +610,7 @@ def insertion_mutation(solution, customers, capacity):
     return chromosome_to_solution(chrom, customers, capacity)
 
 
-def inversion_mutation(solution, customers, capacity):
+def inversion_mutation(solution: Solution, customers: list[Customer], capacity: int) -> Solution:
     """
     Inversion : inverser un sous-segment aléatoire du chromosome.
     """
@@ -535,30 +634,41 @@ def inversion_mutation(solution, customers, capacity):
 # BOUCLE GA (À PARTIR D'UNE POPULATION EXISTANTE)
 # Utilisée par l'interface Streamlit après génération et affichage de la pop.
 # =============================================================================
- 
-def run_ga_from_population(population, customers, capacity,
-                            selection_method, crossover_method, mutation_method,
-                            mutation_rate, time_limit):
+
+def run_ga_from_population(population: list[Solution], customers: list[Customer],
+                           capacity: int,
+                           selection_method: str, crossover_method: str,
+                           mutation_method: str,
+                           mutation_rate: float,
+                           time_limit: float) -> tuple[list[Solution], Solution]:
     """
     Lance la boucle évolutive sur une population déjà générée.
     Retourne (population_finale, meilleure_solution).
+
+    selection_method : 'tournament' | 'roulette'
+    crossover_method : 'ox' | 'pmx'
+    mutation_method  : 'swap' | 'insertion' | 'inversion'
+    time_limit       : budget en secondes (critère d'arrêt unique)
+
+    À chaque génération : remplacement élitiste avec déduplication, puis
+    injection de 2 nouvelles solutions après 10 générations sans amélioration.
     """
     population_size = len(population)
     best_sol        = min(population, key=lambda s: cost(s, customers))
     best_cost       = cost(best_sol, customers)
     stagnation      = 0
     start           = time.time()
- 
+
     while True:
         if time.time() - start >= time_limit:
             break
- 
+
         new_population = []
- 
+
         for _ in range(population_size):
             if time.time() - start >= time_limit:
                 break
- 
+
             # Sélection
             if selection_method == 'tournament':
                 parent1 = tournament_selection(population, customers)
@@ -566,13 +676,13 @@ def run_ga_from_population(population, customers, capacity,
             else:
                 parent1 = roulette_selection(population, customers)
                 parent2 = roulette_selection(population, customers)
- 
+
             # Croisement
             if crossover_method == 'ox':
                 child = ox_crossover(parent1, parent2, customers, capacity)
             else:
                 child = pmx_crossover(parent1, parent2, customers, capacity)
- 
+
             # Mutation
             if random.random() < mutation_rate:
                 if mutation_method == 'swap':
@@ -581,12 +691,12 @@ def run_ga_from_population(population, customers, capacity,
                     child = insertion_mutation(child, customers, capacity)
                 else:
                     child = inversion_mutation(child, customers, capacity)
- 
+
             if is_feasible(child, customers, capacity):
                 new_population.append(child)
             else:
                 new_population.append(copy.deepcopy(random.choice(population)))
- 
+
         # Remplacement élitiste avec déduplication
         combined = sorted(population + new_population, key=lambda s: cost(s, customers))
         new_pop  = []
@@ -598,7 +708,7 @@ def run_ga_from_population(population, customers, capacity,
                 seen.add(key)
             if len(new_pop) == population_size:
                 break
- 
+
         if len(new_pop) < population_size:
             random.shuffle(combined)
             for sol in combined:
@@ -606,40 +716,43 @@ def run_ga_from_population(population, customers, capacity,
                     new_pop.append(sol)
                 if len(new_pop) == population_size:
                     break
- 
+
         population = new_pop
- 
+
         current_best = population[0]
         current_cost = cost(current_best, customers)
- 
+
         if current_cost < best_cost:
             best_sol   = copy.deepcopy(current_best)
             best_cost  = current_cost
             stagnation = 0
         else:
             stagnation += 1
- 
+
         if stagnation >= 10:
             # 🔥 injection de nouvelles solutions pour relancer la diversité
             population += generate_population(customers, capacity, 2)
             population  = sorted(population, key=lambda s: cost(s, customers))[:population_size]
             stagnation  = 0
- 
+
     return population, best_sol
- 
- 
+
+
 # =============================================================================
 # ALGORITHME GÉNÉTIQUE COMPLET (CLI)
 # =============================================================================
- 
-def genetic_algorithm(customers, capacity,
-                      population_size  = 20,
-                      selection_method = 'tournament',
-                      crossover_method = 'ox',
-                      mutation_method  = 'insertion',
-                      mutation_rate    = 0.3,
-                      time_limit       = 10):
- 
+
+def genetic_algorithm(customers: list[Customer], capacity: int,
+                      population_size: int  = 20,
+                      selection_method: str = 'tournament',
+                      crossover_method: str = 'ox',
+                      mutation_method: str  = 'insertion',
+                      mutation_rate: float  = 0.3,
+                      time_limit: float     = 10) -> tuple[list[Solution], Solution]:
+    """
+    Algorithme génétique complet : génère la population initiale puis lance
+    run_ga_from_population. Retourne (population_finale, meilleure_solution).
+    """
     population = generate_population(customers, capacity, population_size)
     population, best_sol = run_ga_from_population(
         population, customers, capacity,
@@ -647,117 +760,20 @@ def genetic_algorithm(customers, capacity,
         mutation_rate, time_limit
     )
     return population, best_sol
-'''def genetic_algorithm(customers, capacity,
-                      population_size  = 20,
-                      selection_method = 'tournament',   # 'tournament' | 'roulette'
-                      crossover_method = 'ox',           # 'ox' | 'pmx'
-                      mutation_method  = 'insertion',    # 'swap' | 'insertion' | 'inversion'
-                      mutation_rate    = 0.3,
-                      time_limit=10):
 
-    # --- Initialisation ---
-    population  = generate_population(customers, capacity, population_size)
-    
-    best_sol    = min(population, key=lambda s: cost(s, customers))
-    best_cost   = cost(best_sol, customers)
-    stagnation  = 0
-    start_time  = time.time()
-    while True:
-        if time.time() - start_time >= time_limit:
-            print(">>> Arret : temps atteint")
-            break
-        #print(f"Temps GA: {round(time.time() - start_time,2)} sec")
-        new_population = []
-
-        for _ in range(population_size):
-            if time.time() - start_time >= time_limit:
-                break
-
-            # ── Sélection ────────────────────────────────────────────────────
-            if selection_method == 'tournament':
-                parent1 = tournament_selection(population, customers)
-                parent2 = tournament_selection(population, customers)
-            else:
-                parent1 = roulette_selection(population, customers)
-                parent2 = roulette_selection(population, customers)
-
-            # ── Croisement ───────────────────────────────────────────────────
-            if crossover_method == 'ox':
-                child = ox_crossover(parent1, parent2, customers, capacity)
-            else:
-                child = pmx_crossover(parent1, parent2, customers, capacity)
-
-            # ── Mutation ─────────────────────────────────────────────────────
-            if random.random() < mutation_rate :
-                if mutation_method == 'swap':
-                    child = swap_mutation(child, customers, capacity)
-                elif mutation_method == 'insertion':
-                    child = insertion_mutation(child, customers, capacity)
-                else:
-                    child = inversion_mutation(child, customers, capacity)
-
-            # ✓ Vérification finale
-            if is_feasible(child, customers, capacity):
-                new_population.append(child)
-            else:
-                if population:
-                    new_population.append(copy.deepcopy(random.choice(population)))
-                else:
-                    new_population.append(child)
-
-        # --- Remplacement élitiste : garder les meilleurs ---
-        combined = sorted(population + new_population, key=lambda s: cost(s, customers))
-
-        new_pop = []
-        seen = set()
-
-        for sol in combined:
-            key = tuple(solution_to_chromosome(sol))  # unique représentation
-            if key not in seen:
-                new_pop.append(sol)
-                seen.add(key)
-            if len(new_pop) == population_size:
-                break
-
-        # 🔥 si pas assez de diversité, compléter
-        if len(new_pop) < population_size:
-            random.shuffle(combined)
-            for sol in combined:
-                if sol not in new_pop:
-                    new_pop.append(sol)
-                if len(new_pop) == population_size:
-                    break
-
-        population = new_pop
-
-        # --- Suivi du meilleur ---
-        current_best = population[0]
-        current_cost = cost(current_best, customers)
-
-        if current_cost < best_cost:
-            best_sol   = copy.deepcopy(current_best)
-            best_cost  = current_cost
-            stagnation = 0
-        else:
-            stagnation += 1
-
-        # Arrêt si stagnation > 30 générations
-        if stagnation >= 10:
-            # 🔥 injection de nouvelles solutions
-            population += generate_population(customers, capacity, 2)
-            population = sorted(population, key=lambda s: cost(s, customers))[:population_size]
-            stagnation = 0
-
-    return population, best_sol'''
-
-def afficher_population(population, customers, capacity, f=None):
+def afficher_population(population: list[Solution], customers: list[Customer],
+                        capacity: int, f=None) -> None:
+    """
+    Afficher chaque solution de la population (routes, nombre de véhicules,
+    distance, coût) dans le terminal, et dans le fichier f s'il est fourni.
+    """
     output = f"\nPopulation generee : {len(population)}\n"
-    
+
     for i, sol in enumerate(population):
         nb_v = len(sol)
         dist = round(total_distance(sol, customers), 2)
         c    = round(cost(sol, customers), 2)
-        
+
         output += f"===== Solution {i+1} =====\n"
         output += f"Routes: {sol}\n"
         output += f"Nb vehicules utilises : {nb_v}\n"
@@ -773,7 +789,14 @@ def afficher_population(population, customers, capacity, f=None):
 # =============================================================================
 
 if __name__ == "__main__":
-    
+
+    parser = argparse.ArgumentParser(
+        description="Compare les combinaisons d'opérateurs du GA sur une instance de Solomon.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="graine aléatoire pour la reproductibilité (défaut : 42)")
+    args = parser.parse_args()
+    random.seed(args.seed)
+
     print("\n===== CONFIGURATION DE L'ALGORITHME =====\n")
 
     print(" Paramètres :")
@@ -782,7 +805,7 @@ if __name__ == "__main__":
     print("4. Mutation rate : probabilité de modification des solutions\n")
 
     filename = input(" Nom du fichier (ex: R101.txt) : ")
-    filepath = os.path.join("instances", filename)
+    filepath = os.path.join(INSTANCES_DIR, filename)
     customers, nb_vehicles, capacity = read_vrptw_file(filepath)
 
     print(f"\nDataset : {len(customers)-1} clients | capacité = {capacity}\n")
@@ -817,10 +840,11 @@ if __name__ == "__main__":
     selected_combinations = []
 
     print("\n===== CHOIX DES COMBINAISONS =====")
-    f = open("resultat.txt", "w", encoding="utf-8")
+    f = open(os.path.join(RESULTS_DIR, "resultat.txt"), "w", encoding="utf-8")
 
 # classe pour écrire dans terminal + fichier
     class Tee:
+        """Flux qui duplique chaque écriture vers plusieurs fichiers."""
         def __init__(self, *files):
             self.files = files
         def write(self, obj):
@@ -846,7 +870,7 @@ if __name__ == "__main__":
 
     start_global = time.time()
     results = []
-    
+
     for sel, cross, mut in selected_combinations:
         config = f"{sel} + {cross} + {mut}"
         print(f"\n-- {config} ...")
@@ -864,7 +888,7 @@ if __name__ == "__main__":
             crossover_method = cross,
             mutation_method  = mut,
             mutation_rate    = mutation_rate,
-            
+
             time_limit = time_per_config
         )
 
@@ -895,6 +919,6 @@ if __name__ == "__main__":
 
     if results:
         print(f"\n Meilleure configuration : {results[0][0]}")
-    
+
     print(f"Temps execution : {round(elapsed,2)} sec")
     f.close()

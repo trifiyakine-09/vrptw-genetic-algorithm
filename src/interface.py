@@ -1,6 +1,11 @@
-import math
+"""
+Interface Streamlit du solveur VRPTW par algorithme génétique.
+
+Lancement depuis la racine du projet :
+    streamlit run src/interface.py
+"""
+
 import random
-import copy
 import time
 
 import streamlit as st
@@ -8,6 +13,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from core import (
+    Customer,
     read_vrptw_content,
     is_feasible,
     total_distance,
@@ -224,12 +230,17 @@ with right_col:
 # RENDER HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_log(text):
+def render_log(text: str) -> None:
+    """Afficher le journal d'exécution (texte échappé) dans l'onglet Run Log."""
     esc = text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
     log_ph.markdown(f'<div class="run-log-box">{esc}</div>', unsafe_allow_html=True)
 
 
-def render_table(results_list):
+def render_table(results_list: list[dict]) -> None:
+    """
+    Afficher le tableau comparatif des combinaisons (trié par coût), le
+    badge du champion et l'histogramme des coûts.
+    """
     if not results_list:
         table_ph.info("No results yet — run the algorithm first.")
         return
@@ -242,6 +253,7 @@ def render_table(results_list):
             f'Vehicles: {champ["Vehicles"]}  ·  Distance: {champ["Distance"]}  ·  Cost: {champ["Cost"]}</div>',
             unsafe_allow_html=True)
         def hl(row):
+            """Surligner la ligne de meilleur coût."""
             if row["Cost"]==best_val:
                 return ['background-color:#eff6ff;color:#1d4ed8;font-weight:700']*len(row)
             return ['']*len(row)
@@ -268,7 +280,11 @@ def render_table(results_list):
         #st.plotly_chart(fig, use_container_width=True, key=f"chart_{len(results_list)}")
         st.plotly_chart(fig, use_container_width=True, key=f"chart_{time.time()}")
 
-def render_map(best_solutions, customers):
+def render_map(best_solutions: dict[str, list[list[int]]], customers: list[Customer]) -> None:
+    """
+    Tracer les routes de la meilleure solution de la configuration choisie
+    dans la liste déroulante (dépôt, clients, une couleur par route).
+    """
     if not best_solutions:
         with map_chart_ph.container(): st.info("No solutions yet — run the algorithm first.")
         return
@@ -322,7 +338,7 @@ def render_map(best_solutions, customers):
         title=dict(text=f"<b>{selected}</b>   |   {nb_v} routes  ·  dist={dist}  ·  cost={cv}",
                    font=dict(size=11,color='#6b7280',family='JetBrains Mono'),x=0.01))
     with map_chart_ph.container(): st.plotly_chart(fig, use_container_width=True)
-    
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIAL RENDER
